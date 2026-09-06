@@ -82,6 +82,11 @@ void WriteUINT(DWORD offset, UINT value)
     if (base != 0) *(UINT*)(base + offset) = value;
 }
 
+struct Vector3 {
+    float x;
+    float y;
+    float z;
+};
 
 // this class is strictly a container that reads and stores playerData
 // to be rendered to the UI, It does not write to game mem.
@@ -93,12 +98,6 @@ struct Player {
     Vector3 position;
     float gravity;
     uint8_t characterType;
-};
-
-struct Vector3 {
-    float x;
-    float y;
-    float z;
 };
 
 template <typename T>
@@ -169,7 +168,7 @@ public:
 
     bool WriteGravity(float newGrav) {
         if (displayPlayer.playerBase == 0) return false;
-        if (!SafeWrite(displayPlayer.playerBase + 0x88, newGrav)) return false;
+        if (!SafeWrite(displayPlayer.playerBase + 0x84, newGrav)) return false;
     }
 
     bool WritePosition(const Vector3& newPos) {
@@ -183,39 +182,27 @@ public:
         return success;
     }
 
-template <typename T>
-bool SafeRead(uintptr_t addr, T* outValue)
-{
-    __try {
-        if (addr == 0) return false;
-        *outValue = *(T*)addr;
-        return true;
+    bool WriteY(float newY) {
+        if (displayPlayer.playerBase == false) return false;
+        return SafeWrite(displayPlayer.playerBase + 0x34, newY);
     }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
-
-template <typename T>
-bool SafeWrite(uintptr_t addr, T value)
-{
-    __try {
-        if (addr == 0) return false;
-        *(T*)addr = value;
-        return true;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        return false;
-    }
-}
+};
 
 // toggles
 volatile bool g_gravityDisabled = false;
+volatile bool g_yFrozen = false;
 volatile float g_heightMod = 1.0f;
+volatile float g_ySaveFrozen = 0.0f;
 volatile float g_savedY = 0.0f;
 volatile float g_savedX = 0.0f;
 volatile float g_savedZ = 0.0f;
 volatile bool g_hasSavedY = false;
+
+GameState g_gameState;
+static float g_originalGravity = 1.0f;
+static bool  g_gravityCaptured = false;
+
+static bool g_yCaptured = false;
 
 HMODULE g_hMyModule = NULL;
 int g_sceneId = -1;
@@ -230,17 +217,37 @@ enum ControlId : int {
     ID_BUTTON_HEIGHT_UP,
     ID_BUTTON_HEIGHT_DOWN,
     ID_STATIC_HEIGHT_MOD,
-    ID_APPLY_HEIGHT
+    ID_APPLY_HEIGHT,
+    ID_CHECK_FREEZE_Y
 };
 
 HWND g_hStaticPlayerY = NULL;
 HWND g_hStaticCameraInfo = NULL;
 HWND g_hCheckGravity = NULL;
+HWND g_hCheckFreezeY = NULL;
 HWND g_hStaticHeightMod = NULL;
 
 void RefreshDebugWindow()
 {
- 
+    g_gameState.Refresh();
+
+    if (g_gameState.displayPlayer.playerBase == 0) {
+        SetWindowTextA(g_hStaticPlayerY, "Player Pos: (not found)");
+        return;
+    }
+
+    char buf[128];
+    sprintf_s(buf, "Player Pos X/Y/Z: %.2f %.2f %.2f  Grav=%.2f",
+        g_gameState.displayPlayer.position.x,
+        g_gameState.displayPlayer.position.y,
+        g_gameState.displayPlayer.position.z,
+        g_gameState.displayPlayer.gravity);
+
+    SetWindowTextA(g_hStaticPlayerY, buf);
+
+    // reflect actual toggle state in case something external changed it
+    SendMessageA(g_hCheckGravity, BM_SETCHECK, g_gravityDisabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageA(g_hCheckFreezeY, BM_SETCHECK, g_yFrozen ? BST_CHECKED : BST_UNCHECKED, 0);
 }
 
 LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -249,6 +256,22 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
     case WM_CREATE:
     {
+        g_hStaticPlayerY = CreateWindowA("STATIC", "Player Pos: --",
+            WS_CHILD | WS_VISIBLE, 10, 10, 400, 20, hwnd, (HMENU)ID_STATIC_PLAYER_Y, g_hMyModule, NULL);
+
+        g_hCheckGravity = CreateWindowA("BUTTON", "Disable Gravity",
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 10, 40, 150, 20, hwnd, (HMENU)ID_CHECK_GRAVITY, g_hMyModule, NULL);
+
+        g_hCheckFreezeY = CreateWindowA("BUTTON", "Freeze Y",
+            WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 10, 70, 150, 20, hwnd, (HMENU)ID_CHECK_FREEZE_Y, g_hMyModule, NULL);
+
+        CreateWindowA("BUTTON", "Save Position",
+            WS_CHILD | WS_VISIBLE, 10, 100, 120, 25, hwnd, (HMENU)ID_BUTTON_SAVE_Y, g_hMyModule, NULL);
+
+        CreateWindowA("BUTTON", "Load Position",
+            WS_CHILD | WS_VISIBLE, 140, 100, 120, 25, hwnd, (HMENU)ID_BUTTON_LOAD_Y, g_hMyModule, NULL);
+
+        SetTimer(hwnd, 1, 100, NULL);
         return 0;
     }
 
@@ -260,6 +283,28 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
         int id = LOWORD(wParam);
         int notify = HIWORD(wParam);
+
+        if (id == ID_CHECK_GRAVITY && notify == BN_CLICKED) {
+            bool checked = (SendMessageA(g_hCheckGravity, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            g_gravityDisabled = checked;
+        }
+        else if (id == ID_BUTTON_SAVE_Y && notify == BN_CLICKED) {
+            g_gameState.Refresh(); // make sure we're saving current, not stale, position
+            g_savedX = g_gameState.displayPlayer.position.x;
+            g_savedY = g_gameState.displayPlayer.position.y;
+            g_savedZ = g_gameState.displayPlayer.position.z;
+            g_hasSavedY = true;
+        }
+        else if (id == ID_BUTTON_LOAD_Y && notify == BN_CLICKED) {
+            if (g_hasSavedY) {
+                Vector3 pos = { g_savedX, g_savedY, g_savedZ };
+                g_gameState.WritePosition(pos);
+            }
+        }
+        else if (id == ID_CHECK_FREEZE_Y && notify == BN_CLICKED) {
+            bool checked = (SendMessageA(g_hCheckFreezeY, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            g_yFrozen = checked;
+        }
 
         return 0;
     }
@@ -311,6 +356,33 @@ DWORD WINAPI GameplayThread(LPVOID lpParam)
 {
     while (true)
     {
+        if (g_gameState.displayPlayer.playerBase != 0) {
+            float currentGrav = 0.0f;
+            if (SafeRead(g_gameState.displayPlayer.playerBase + 0x84, &currentGrav)) {
+
+                if (g_gravityDisabled) {
+                    if (!g_gravityCaptured) {
+                        g_gravityCaptured = true;
+                    }
+                    g_gameState.WriteGravity(0.0f);
+                }
+                else if (g_gravityCaptured) {
+                    g_gameState.WriteGravity(g_originalGravity);
+                    g_gravityCaptured = false;
+                }
+            }
+
+            if (g_yFrozen) {
+                if (!g_yCaptured) {
+                    g_yCaptured = true;
+                    g_ySaveFrozen = g_gameState.displayPlayer.position.y;
+                }
+                g_gameState.WriteY(g_ySaveFrozen);
+            }
+            else {
+                g_yCaptured = false;
+            }
+        }
 
         Sleep(50);
     }
