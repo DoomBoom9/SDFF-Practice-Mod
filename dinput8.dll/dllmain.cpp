@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <cstdio>
 #include <cstdint>
+#include <string>
 
 // dinput8 proxy wrapper
 HMODULE g_hOriginalDll = NULL;
@@ -47,6 +48,9 @@ const uintptr_t ADDR_SCENEID = 0x006d9924;
 const uintptr_t ADDR_CAMERA_CONTROLLER_PB = 0x006D50B8;
 const uintptr_t ADDR_DAT_0064EF98_PB = 0x0064EF98;
 
+const uintptr_t ADDR_LEVEL_MODE = 0x006d99CC;
+const uintptr_t ADDR_SCENE_ID = 0x006d9924;
+
 const DWORD OFFSET_3D_RENDER_FLAGS = 0x00;
 const DWORD OFFSET_COLLISION_FLAGS = 0x04;
 const DWORD OFFSET_DRAW_LEGEND = 0x34;
@@ -88,9 +92,6 @@ struct Vector3 {
     float z;
 };
 
-// this class is strictly a container that reads and stores playerData
-// to be rendered to the UI, It does not write to game mem.
-// any operation that writes should be done by the GameState class.
 struct Player {
     uintptr_t playerBase;
     uintptr_t vtable;
@@ -98,6 +99,11 @@ struct Player {
     Vector3 position;
     float gravity;
     uint8_t characterType;
+};
+
+struct Level {
+    uint32_t sceneId;
+    uint32_t mode;
 };
 
 template <typename T>
@@ -158,12 +164,28 @@ namespace PlayerMemory {
 
 }
 
+namespace LevelMemory {
+    bool Read(Level& out) {
+        bool safe = true;
+        safe &= SafeRead(ADDR_LEVEL_MODE, &out.mode);
+        safe &= SafeRead(ADDR_SCENE_ID, &out.sceneId);
+
+        return safe;
+    }
+}
+
+// idek if this class makes sense
+// since we have the memory namespace it would make more sense to have this be
+// the container and make any writes from the given namespace.
+// might rework later.
 class GameState {
 public:
     Player displayPlayer;
+    Level displayLevel;
 
     void Refresh() {
         PlayerMemory::Read(displayPlayer);
+        LevelMemory::Read(displayLevel);
     }
 
     bool WriteGravity(float newGrav) {
@@ -186,7 +208,27 @@ public:
         if (displayPlayer.playerBase == false) return false;
         return SafeWrite(displayPlayer.playerBase + 0x34, newY);
     }
+
+    // 0 and 1 are the only valid modes so This forces it to be that
+    bool WriteLevelMode(uint32_t mode) {
+        bool success = true;
+        return SafeWrite(ADDR_LEVEL_MODE, mode);
+    }
+
+    bool WriteSceneId(uint32_t sceneId) {
+        if (sceneId > 27) return false;
+        return SafeWrite(ADDR_SCENE_ID, sceneId);
+    }
 };
+
+const char* ResolveModeName(uint32_t mode) {
+    if ((mode & 0x1) == 0x1) {
+        return "Adventure";
+    }
+    else {
+        return "Story";
+    }
+}
 
 // toggles
 volatile bool g_gravityDisabled = false;
@@ -218,7 +260,10 @@ enum ControlId : int {
     ID_BUTTON_HEIGHT_DOWN,
     ID_STATIC_HEIGHT_MOD,
     ID_APPLY_HEIGHT,
-    ID_CHECK_FREEZE_Y
+    ID_CHECK_FREEZE_Y,
+    ID_BUTTON_LEVEL_MODE,
+    ID_STATIC_LEVEL_MODE,
+    ID_STATIC_SCENE_ID
 };
 
 HWND g_hStaticPlayerY = NULL;
@@ -226,6 +271,8 @@ HWND g_hStaticCameraInfo = NULL;
 HWND g_hCheckGravity = NULL;
 HWND g_hCheckFreezeY = NULL;
 HWND g_hStaticHeightMod = NULL;
+HWND g_hStaticLevelMode = NULL;
+HWND g_hStaticSceneId = NULL;
 
 void RefreshDebugWindow()
 {
@@ -244,6 +291,13 @@ void RefreshDebugWindow()
         g_gameState.displayPlayer.gravity);
 
     SetWindowTextA(g_hStaticPlayerY, buf);
+
+    sprintf_s(buf, "Game Mode: %s", ResolveModeName(g_gameState.displayLevel.mode));
+
+    SetWindowTextA(g_hStaticLevelMode, buf);
+
+    sprintf_s(buf, "Scene ID: %d", g_gameState.displayLevel.sceneId);
+    SetWindowTextA(g_hStaticSceneId, buf);
 
     // reflect actual toggle state in case something external changed it
     SendMessageA(g_hCheckGravity, BM_SETCHECK, g_gravityDisabled ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -270,6 +324,16 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
         CreateWindowA("BUTTON", "Load Position",
             WS_CHILD | WS_VISIBLE, 140, 100, 120, 25, hwnd, (HMENU)ID_BUTTON_LOAD_Y, g_hMyModule, NULL);
+
+        CreateWindowA("BUTTON", "Toggle GameMode",
+            WS_CHILD | WS_VISIBLE, 10, 130, 150, 25, hwnd, (HMENU)ID_BUTTON_LEVEL_MODE, g_hMyModule, NULL);
+
+        g_hStaticLevelMode = CreateWindowA("STATIC", "Level Mode: --",
+            WS_CHILD | WS_VISIBLE, 10, 160, 400, 20, hwnd, (HMENU)ID_STATIC_LEVEL_MODE, g_hMyModule, NULL);
+
+        g_hStaticSceneId = CreateWindowA("STATIC", "Scene ID: --",
+            WS_CHILD | WS_VISIBLE, 10, 180, 400, 20, hwnd, (HMENU)ID_STATIC_SCENE_ID, g_hMyModule, NULL);
+
 
         SetTimer(hwnd, 1, 100, NULL);
         return 0;
@@ -304,6 +368,13 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         else if (id == ID_CHECK_FREEZE_Y && notify == BN_CLICKED) {
             bool checked = (SendMessageA(g_hCheckFreezeY, BM_GETCHECK, 0, 0) == BST_CHECKED);
             g_yFrozen = checked;
+        }
+        else if (id == ID_BUTTON_LEVEL_MODE && notify == BN_CLICKED) {
+            uint32_t mode = 1;
+            if (g_gameState.displayLevel.mode & 0x1) {
+                mode = 0;
+            }
+            g_gameState.WriteLevelMode(mode);
         }
 
         return 0;
