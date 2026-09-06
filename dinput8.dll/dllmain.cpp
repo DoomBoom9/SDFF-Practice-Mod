@@ -43,8 +43,6 @@ const uintptr_t PTR_DEBUG_STRUCT_PB = 0x006E0550;
 const uintptr_t ADDR_OpenCharacterDataDebugWindow_PB = 0x00432BDE; // FUN_00432bde
 const uintptr_t ADDR_HOOK_TARGET_PB = 0x0042576F; // DrawDebugOverlays entry
 
-const uintptr_t ADDR_SCENEID = 0x006d9924;
-
 const uintptr_t ADDR_CAMERA_CONTROLLER_PB = 0x006D50B8;
 const uintptr_t ADDR_DAT_0064EF98_PB = 0x0064EF98;
 
@@ -102,7 +100,7 @@ struct Player {
 };
 
 struct Level {
-    uint32_t sceneId;
+    uint16_t sceneId;
     uint32_t mode;
 };
 
@@ -215,7 +213,7 @@ public:
         return SafeWrite(ADDR_LEVEL_MODE, mode);
     }
 
-    bool WriteSceneId(uint32_t sceneId) {
+    bool WriteSceneId(uint16_t sceneId) {
         if (sceneId > 27) return false;
         return SafeWrite(ADDR_SCENE_ID, sceneId);
     }
@@ -239,6 +237,8 @@ volatile float g_savedY = 0.0f;
 volatile float g_savedX = 0.0f;
 volatile float g_savedZ = 0.0f;
 volatile bool g_hasSavedY = false;
+volatile bool g_gotoBoxesDirty = false;
+volatile bool g_updatingGotoBoxes = false;
 
 GameState g_gameState;
 static float g_originalGravity = 1.0f;
@@ -263,7 +263,11 @@ enum ControlId : int {
     ID_CHECK_FREEZE_Y,
     ID_BUTTON_LEVEL_MODE,
     ID_STATIC_LEVEL_MODE,
-    ID_STATIC_SCENE_ID
+    ID_STATIC_SCENE_ID,
+    ID_EDIT_GOTO_X,
+    ID_EDIT_GOTO_Y,
+    ID_EDIT_GOTO_Z,
+    ID_BUTTON_GOTO
 };
 
 HWND g_hStaticPlayerY = NULL;
@@ -273,7 +277,24 @@ HWND g_hCheckFreezeY = NULL;
 HWND g_hStaticHeightMod = NULL;
 HWND g_hStaticLevelMode = NULL;
 HWND g_hStaticSceneId = NULL;
+HWND g_hEditGotoX = NULL;
+HWND g_hEditGotoY = NULL;
+HWND g_hEditGotoZ = NULL;
 
+void GUISavePosition() {
+            g_gameState.Refresh(); // make sure we're saving current, not stale, position
+            g_savedX = g_gameState.displayPlayer.position.x;
+            g_savedY = g_gameState.displayPlayer.position.y;
+            g_savedZ = g_gameState.displayPlayer.position.z;
+            g_hasSavedY = true;
+}
+
+void GUILoadPosition() {
+    if (g_hasSavedY) {
+        Vector3 pos = { g_savedX, g_savedY, g_savedZ };
+        g_gameState.WritePosition(pos);
+    }
+}
 void RefreshDebugWindow()
 {
     g_gameState.Refresh();
@@ -298,6 +319,20 @@ void RefreshDebugWindow()
 
     sprintf_s(buf, "Scene ID: %d", g_gameState.displayLevel.sceneId);
     SetWindowTextA(g_hStaticSceneId, buf);
+
+    if (!g_gotoBoxesDirty) {
+        g_updatingGotoBoxes = true; // suppress EN_CHANGE while we write
+
+        char bx[32], by[32], bz[32];
+        sprintf_s(bx, "%.2f", g_gameState.displayPlayer.position.x);
+        sprintf_s(by, "%.2f", g_gameState.displayPlayer.position.y);
+        sprintf_s(bz, "%.2f", g_gameState.displayPlayer.position.z);
+        SetWindowTextA(g_hEditGotoX, bx);
+        SetWindowTextA(g_hEditGotoY, by);
+        SetWindowTextA(g_hEditGotoZ, bz);
+
+        g_updatingGotoBoxes = false;
+    }
 
     // reflect actual toggle state in case something external changed it
     SendMessageA(g_hCheckGravity, BM_SETCHECK, g_gravityDisabled ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -334,6 +369,21 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         g_hStaticSceneId = CreateWindowA("STATIC", "Scene ID: --",
             WS_CHILD | WS_VISIBLE, 10, 180, 400, 20, hwnd, (HMENU)ID_STATIC_SCENE_ID, g_hMyModule, NULL);
 
+        CreateWindowA("STATIC", "Goto X/Y/Z:", WS_CHILD | WS_VISIBLE,
+            10, 200, 80, 20, hwnd, NULL, g_hMyModule, NULL);
+
+        g_hEditGotoX = CreateWindowA("EDIT", "0.0", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+            90, 200, 80, 20, hwnd, (HMENU)ID_EDIT_GOTO_X, g_hMyModule, NULL);
+
+        g_hEditGotoY = CreateWindowA("EDIT", "0.0", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+            175, 200, 80, 20, hwnd, (HMENU)ID_EDIT_GOTO_Y, g_hMyModule, NULL);
+
+        g_hEditGotoZ = CreateWindowA("EDIT", "0.0", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
+            260, 200, 80, 20, hwnd, (HMENU)ID_EDIT_GOTO_Z, g_hMyModule, NULL);
+
+        CreateWindowA("BUTTON", "Goto", WS_CHILD | WS_VISIBLE,
+            350, 200, 80, 25, hwnd, (HMENU)ID_BUTTON_GOTO, g_hMyModule, NULL);
+
 
         SetTimer(hwnd, 1, 100, NULL);
         return 0;
@@ -353,17 +403,10 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             g_gravityDisabled = checked;
         }
         else if (id == ID_BUTTON_SAVE_Y && notify == BN_CLICKED) {
-            g_gameState.Refresh(); // make sure we're saving current, not stale, position
-            g_savedX = g_gameState.displayPlayer.position.x;
-            g_savedY = g_gameState.displayPlayer.position.y;
-            g_savedZ = g_gameState.displayPlayer.position.z;
-            g_hasSavedY = true;
+            GUISavePosition();
         }
         else if (id == ID_BUTTON_LOAD_Y && notify == BN_CLICKED) {
-            if (g_hasSavedY) {
-                Vector3 pos = { g_savedX, g_savedY, g_savedZ };
-                g_gameState.WritePosition(pos);
-            }
+            GUILoadPosition();
         }
         else if (id == ID_CHECK_FREEZE_Y && notify == BN_CLICKED) {
             bool checked = (SendMessageA(g_hCheckFreezeY, BM_GETCHECK, 0, 0) == BST_CHECKED);
@@ -375,6 +418,39 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
                 mode = 0;
             }
             g_gameState.WriteLevelMode(mode);
+        }
+        if ((id == ID_EDIT_GOTO_X || id == ID_EDIT_GOTO_Y || id == ID_EDIT_GOTO_Z) && notify == EN_CHANGE) {
+            if (!g_updatingGotoBoxes) {
+                g_gotoBoxesDirty = true;
+            }
+            return 0;
+        }
+
+        if (id == ID_BUTTON_GOTO && notify == BN_CLICKED) {
+            char bufX[64], bufY[64], bufZ[64];
+            GetWindowTextA(g_hEditGotoX, bufX, sizeof(bufX));
+            GetWindowTextA(g_hEditGotoY, bufY, sizeof(bufY));
+            GetWindowTextA(g_hEditGotoZ, bufZ, sizeof(bufZ));
+
+            char* endX = nullptr, * endY = nullptr, * endZ = nullptr;
+            float x = strtof(bufX, &endX);
+            float y = strtof(bufY, &endY);
+            float z = strtof(bufZ, &endZ);
+
+            bool validX = (endX != bufX);
+            bool validY = (endY != bufY);
+            bool validZ = (endZ != bufZ);
+
+            if (validX && validY && validZ) {
+                Vector3 pos = { x, y, z };
+                g_gameState.WritePosition(pos);
+            }
+            else {
+                MessageBoxA(hwnd, "Enter valid numbers for X, Y, and Z.", "Invalid input", MB_OK | MB_ICONWARNING);
+            }
+
+            g_gotoBoxesDirty = false;
+            return 0;
         }
 
         return 0;
@@ -429,6 +505,12 @@ DWORD WINAPI GameplayThread(LPVOID lpParam)
     {
         if (g_gameState.displayPlayer.playerBase != 0) {
             float currentGrav = 0.0f;
+            if (GetAsyncKeyState(VK_F1) & 0x8000) {
+                GUISavePosition();
+            }
+            if (GetAsyncKeyState(VK_F2) & 0x8000) {
+                GUILoadPosition();
+            }
             if (SafeRead(g_gameState.displayPlayer.playerBase + 0x84, &currentGrav)) {
 
                 if (g_gravityDisabled) {
