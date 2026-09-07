@@ -92,6 +92,7 @@ struct Vector3 {
 
 struct Player {
     uintptr_t playerBase;
+    uintptr_t jumpFlag;
     uintptr_t vtable;
     float health;
     Vector3 position;
@@ -143,12 +144,26 @@ namespace PlayerMemory {
         return addr;
     }
 
+    uintptr_t ResolveJumpPointer() {
+        uintptr_t basePtr = 0;
+        if (!SafeRead(g_addrPlayerBase, &basePtr)) return 0;
+
+        uint32_t offsets[3] = { 0x10, 0x1E4, 0xFBC };
+        uintptr_t addr = basePtr;
+        for (int i = 0; i < 2; i++) {
+            if (!SafeRead(addr + offsets[i], &addr) || addr == 0) return 0;
+        }
+
+        return addr + offsets[2];
+    }
+
     // can still read garbage but wont crash on an access violation
     // writes the player struct to out if possible
     // returns true if all reads were successful, otherwise returns false.
     bool Read(Player& out) {
         out.playerBase = ResolveBase();
         if (out.playerBase == 0) return false;
+        out.jumpFlag = ResolveJumpPointer();
 
         bool safe = true;
         safe &= SafeRead(out.playerBase + 0x30, &out.position.x);
@@ -217,6 +232,11 @@ public:
         if (sceneId > 27) return false;
         return SafeWrite(ADDR_SCENE_ID, sceneId);
     }
+
+    bool InfiniteJump() {
+        uint8_t flag = 0x03;
+        return SafeWrite(displayPlayer.jumpFlag, flag);
+    }
 };
 
 const char* ResolveModeName(uint32_t mode) {
@@ -239,6 +259,7 @@ volatile float g_savedZ = 0.0f;
 volatile bool g_hasSavedY = false;
 volatile bool g_gotoBoxesDirty = false;
 volatile bool g_updatingGotoBoxes = false;
+volatile bool g_hasInfiniteJumps = false;
 
 GameState g_gameState;
 static float g_originalGravity = 1.0f;
@@ -267,7 +288,8 @@ enum ControlId : int {
     ID_EDIT_GOTO_X,
     ID_EDIT_GOTO_Y,
     ID_EDIT_GOTO_Z,
-    ID_BUTTON_GOTO
+    ID_BUTTON_GOTO,
+    ID_BUTTON_INFINITE_JUMP
 };
 
 HWND g_hStaticPlayerY = NULL;
@@ -350,6 +372,9 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
         g_hCheckGravity = CreateWindowA("BUTTON", "Disable Gravity",
             WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 10, 40, 150, 20, hwnd, (HMENU)ID_CHECK_GRAVITY, g_hMyModule, NULL);
+
+        CreateWindowA("BUTTON", "Toggle Infinite Jumps",
+            WS_CHILD | WS_VISIBLE, 140, 40, 200, 25, hwnd, (HMENU)ID_BUTTON_INFINITE_JUMP, g_hMyModule, NULL);
 
         g_hCheckFreezeY = CreateWindowA("BUTTON", "Freeze Y",
             WS_CHILD | WS_VISIBLE | BS_AUTOCHECKBOX, 10, 70, 150, 20, hwnd, (HMENU)ID_CHECK_FREEZE_Y, g_hMyModule, NULL);
@@ -453,6 +478,10 @@ LRESULT CALLBACK DebugWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             return 0;
         }
 
+        if (id == ID_BUTTON_INFINITE_JUMP && notify == BN_CLICKED) {
+            g_hasInfiniteJumps = !g_hasInfiniteJumps;
+        }
+
         return 0;
     }
 
@@ -534,6 +563,12 @@ DWORD WINAPI GameplayThread(LPVOID lpParam)
             }
             else {
                 g_yCaptured = false;
+            }
+            if (GetAsyncKeyState(VK_F3) & 0x8000) {
+                g_hasInfiniteJumps = !g_hasInfiniteJumps;
+            }
+            if (g_hasInfiniteJumps) {
+                g_gameState.InfiniteJump();
             }
         }
 
